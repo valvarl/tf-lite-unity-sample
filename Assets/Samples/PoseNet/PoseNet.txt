@@ -1,0 +1,614 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.IO;
+using UnityEngine;
+using Cysharp.Threading.Tasks;
+using OpenCvSharp;
+using OpenCvSharp.Tracking;
+
+namespace TensorFlowLite
+{
+
+    /// <summary>
+    /// Pose Estimation Example
+    /// https://www.tensorflow.org/lite/models/pose_estimation/overview
+    /// </summary>
+    public class PoseNet : BaseImagePredictor<float>
+    {
+        public enum Part
+        {
+            Head_top = 0, //0
+            Thorax, //1
+            R_Shoulder, //2
+            R_Elbow, //3
+            R_Wrist, // 4
+            L_Shoulder, // 5
+            L_Elbow, // 6
+            L_Wrist, //7
+            R_Hip, //8
+            R_Knee, //9
+            R_Ankle, //10
+            L_Hip, // 11
+            L_Knee, // 12
+            L_Ankle, // 13
+            Pelvis, //14
+            Spine, //15
+            Head, //16
+            R_Hand, //17
+            L_Hand, //18
+            R_Toe, //19
+            L_Toe //20
+        }
+
+        public static readonly Part[,] Connections = new Part[,]
+        {
+            // HEAD
+            { Part.Head_top, Part.Head },
+            { Part.Head, Part.Thorax },
+            { Part.Thorax, Part.Spine },
+            { Part.Spine, Part.Pelvis },
+            // BODY
+            { Part.Pelvis, Part.R_Hip },
+            { Part.Pelvis, Part.L_Hip },
+            { Part.R_Hip, Part.R_Knee },
+            { Part.R_Knee, Part.R_Ankle },
+            { Part.R_Ankle, Part.R_Toe },
+            { Part.L_Hip, Part.L_Knee },
+            { Part.L_Knee, Part.L_Ankle },
+            { Part.L_Ankle, Part.L_Toe },
+            { Part.Thorax, Part.R_Shoulder },
+            { Part.R_Shoulder, Part.R_Elbow },
+            { Part.R_Elbow, Part.R_Wrist },
+            { Part.R_Wrist, Part.R_Hand },
+            { Part.Thorax, Part.L_Shoulder },
+            { Part.L_Shoulder, Part.L_Elbow },
+            { Part.L_Elbow, Part.L_Wrist },
+            { Part.L_Wrist, Part.L_Hand }
+        };
+
+        [System.Serializable]
+        public struct Result
+        {
+            public Part part;
+            public float confidence;
+            public float x;
+            public float y;
+        }
+
+        static int joint_num = 21;
+        static int depth_dim = 32;
+        static (int, int) input_shape = (256, 256);
+        static (int, int) output_shape = (32, 32);
+
+        static Scalar pixel_mean = new Scalar(0.485, 0.456, 0.406);
+        static Scalar pixel_std = new Scalar(0.229, 0.224, 0.225);
+        
+        int[] bbox_3d_shape = new int[]{ 2000, 2000, 2000 };
+        float[] focal = new float[]{ 1500, 1500 };
+        float[] princpt = null;        
+        
+        float root_depth = 12500;  // obtain this from RootNet (https://github.com/mks0601/3DMPPE_ROOTNET_RELEASE/tree/master/demo)
+
+        Result[] results = new Result[joint_num];
+
+        float[,] img2bb_trans = new float[2, 3];
+        float[,,] inputs0 = new float[3, input_shape.Item1, input_shape.Item2];
+        float[,,] outputs0 = null;
+
+        // tracking
+        // public CascadeClassifier humanCascade;
+        public HOGDescriptor hog;
+        public Tracker tracker;
+        public bool tracking = false;
+        public Rect2d? trackedRect = null;
+
+        public PoseNet(string modelPath) : base(modelPath, Accelerator.GPU)
+        {
+            var odim0 = interpreter.GetOutputTensorInfo(0).shape;
+            outputs0 = new float[odim0[1], odim0[2], odim0[3]];
+
+            // humanCascade = new OpenCvSharp.CascadeClassifier("Assets/Samples/PoseNet/haarcascade_fullbody.xml");
+            hog = new HOGDescriptor();
+            hog.SetSVMDetector(HOGDescriptor.GetDefaultPeopleDetector());
+            tracker = Tracker.Create(TrackerTypes.KCF);
+        }
+
+        // static OpenCvSharp.Rect2d? DetectHuman(Mat frame, CascadeClassifier humanCascade)
+        // {
+        //     var gray = new Mat();
+        //     Cv2.CvtColor(frame, gray, ColorConversionCodes.BGR2GRAY);
+        //     Debug.Log(gray);
+        //     var humans = humanCascade.DetectMultiScale(gray, 1.1, 3, HaarDetectionType.ScaleImage, new Size(60, 60));
+
+        //     Debug.Log(humans.Length);
+
+        //     if (humans.Length > 0)
+        //     {
+        //         var rect = humans[0];
+        //         return new Rect2d(rect.X, rect.Y, rect.Width, rect.Height);
+        //     }
+
+        //     return null;
+        // }
+
+        static OpenCvSharp.Rect2d? DetectHuman(Mat frame, HOGDescriptor hog)
+        {
+            var gray = new Mat();
+            Cv2.CvtColor(frame, gray, ColorConversionCodes.RGB2GRAY);
+            Debug.Log(gray);
+
+            var humans = hog.DetectMultiScale(gray, winStride: new Size(8, 8), padding: new Size(8, 8), scale: 1.05);
+
+            Debug.Log(humans.Length);
+
+            if (humans.Length > 0)
+            {
+                var rect = humans[0];
+                return new Rect2d(rect.X, rect.Y, rect.Width, rect.Height);
+            }
+
+            return null;
+        }
+
+        public void GetBbox(Mat frame)
+        {
+            if (!tracking)
+            {
+                trackedRect = DetectHuman(frame, hog);
+
+                if (trackedRect.HasValue)
+                {
+                    tracker.Init(frame, trackedRect.Value);
+                    tracking = true;
+                }
+            }
+            else
+            {
+                Rect2d bbox = (Rect2d)trackedRect;
+                bool success = tracker.Update(frame, ref bbox);
+                trackedRect = bbox;
+
+                if (!(success && trackedRect.HasValue))
+                {
+                    tracking = false;
+                }
+            }
+        }
+
+        public override void Invoke(Texture inputTex)
+        {
+            // загрузить изображение с диска
+            byte[] fileData = File.ReadAllBytes("Assets/Samples/PoseNet/Liza.jpg");
+
+            // создать новый экземпляр Texture2D с заданным размером
+            Texture2D tex2d = new Texture2D(500, 750);
+
+            // загрузить данные изображения в текстуру
+            tex2d.LoadImage(fileData);
+
+            Mat original_img = OpenCvSharp.Unity.TextureToMat(tex2d);
+            // Mat original_img = OpenCvSharp.Unity.TextureToMat(ToTexture2D(inputTex)); // раскоментить для вебкамеры
+
+
+            Preprocess(original_img, inputTex.width, inputTex.height);
+            Debug.Log("HELLO");
+            // for (int i =0; i < 5; i++) 
+            // {
+            //     for (int j = 0; j < 5; j++)
+            //     {
+            //         Debug.Log(inputs0[i, j, 0].ToString() + " " + inputs0[i, j, 1].ToString() + " " + inputs0[i, j, 2].ToString());
+            //     }
+            // }
+            interpreter.SetInputTensorData(0, inputs0);
+            interpreter.Invoke();
+            Debug.Log("HELLO2");
+            interpreter.GetOutputTensorData(0, outputs0);
+            // for (int i =0; i < 5; i++) 
+            // {
+            //     for (int j = 0; j < 5; j++)
+            //     {
+            //         Debug.Log(outputs0[0, i, j].ToString() + " " + outputs0[0, i, j].ToString() + " " + outputs0[0, i, j].ToString());
+            //     }
+            // }
+            var pose_3d = Postprocess();
+            float[,] output_pose_2d = pose_3d.Item1;
+            float[,] output_pose_3d = pose_3d.Item2;
+
+            // for (int i = 0; i < 21; i++) {
+            //     Debug.Log(output_pose_2d[i, 0].ToString() + " " + output_pose_2d[i, 1].ToString());
+            // }
+
+            Mat visImg = Utils.VisKeyPoints(original_img, output_pose_2d, Connections);
+            // Cv2.ImWrite("output_pose_2d.jpg", visImg);
+
+            Debug.Log("HELLO3");
+
+            Cv2.CvtColor(visImg, visImg, ColorConversionCodes.BGR2RGB);
+            Texture2D out_texture = OpenCvSharp.Unity.MatToTexture(visImg);
+
+            byte[] bytes = out_texture.EncodeToPNG();
+            var dirPath = Application.dataPath + "/../SaveImages/";
+            Debug.Log(dirPath);
+            if(!Directory.Exists(dirPath)) {
+                Directory.CreateDirectory(dirPath);
+            }
+            File.WriteAllBytes(dirPath + "output_pose_2d" + ".png", bytes);
+        }
+
+        public Texture2D ToTexture2D(Texture rTex)
+        {
+            Texture2D dest = new Texture2D(rTex.width, rTex.height, TextureFormat.RGB24, false);
+            dest.Apply(false);
+            Graphics.CopyTexture(rTex, dest);
+            return dest;
+        }
+
+        static Mat DivideByScalar(Mat srcImage, Scalar weights)
+        {
+            // Создание матрицы весов
+            Mat weightMatrix = new Mat(srcImage.Rows, srcImage.Cols, srcImage.Type(), weights);
+
+            // Выполнение поэлементного деления
+            Mat resultImage = new Mat();
+            Cv2.Divide(srcImage, weightMatrix, resultImage);
+
+            return resultImage;
+        }
+
+        static float[,,] MatToFloatArray(Mat mat)
+        {
+            if (mat.Empty())
+            {
+                throw new ArgumentException("The input Mat object is empty.");
+            }
+
+            if (mat.Type() != MatType.CV_32FC1 && mat.Type() != MatType.CV_32FC3 && mat.Type() != MatType.CV_32FC4)
+            {
+                mat.ConvertTo(mat, MatType.CV_32F);
+            }
+
+            int rows = mat.Rows;
+            int cols = mat.Cols;
+            int channels = mat.Channels();
+            float[,,] floatArray = new float[channels, rows, cols];
+
+            for (int row = 0; row < rows; row++)
+            {
+                for (int col = 0; col < cols; col++)
+                {
+                    float[] pixel = new float[channels];
+                    mat.GetArray(row, col, pixel);
+                    for (int ch = 0; ch < channels; ch++)
+                    {
+                        floatArray[ch, row, col] = pixel[ch];
+                    }
+                }
+            }
+
+            return floatArray;
+        }
+
+        public void Preprocess(Mat original_img, int width, int height)
+        {
+            Cv2.CvtColor(original_img, original_img, ColorConversionCodes.BGR2RGB);  // под вопросом, необходимо ли это для вебкамеры?
+
+            if (princpt == null) {
+                princpt = new float[]{width / 2, height / 2};
+            }
+
+            GetBbox(original_img);
+            trackedRect = new Rect2d(155f, 36f, 180f, 670f);  // отладка
+            // Debug.Log(trackedRect);
+            
+            Rect2d? processed_bbox = Utils.ProcessBbox(trackedRect.Value, height, width, input_shape);
+            // Debug.Log(processed_bbox);
+            var patch_image = Utils.GeneratePatchImage(original_img, processed_bbox.Value, false, 1.0f, 0.0f, false, input_shape);
+            // Debug.Log(patch_image);
+
+            Mat image = patch_image.Item1;
+            Mat img2bb_trans_mat = patch_image.Item2;
+            
+            for (int i = 0; i < 2; i++)
+            {
+                for (int j = 0; j < 3; j++)
+                {
+                    img2bb_trans[i, j] = (float)img2bb_trans_mat.At<double>(i, j);
+                }
+            }
+
+            image.ConvertTo(image, MatType.CV_32F, 1.0, 0);
+            image = image - pixel_mean;
+            image = DivideByScalar(image, pixel_std);
+
+            // for (int i = 0; i < 5; i++) 
+            // {
+            //     for (int j = 0; j < 5; j++)
+            //     {
+            //         Debug.Log(image[i, i + 1, j, j+1].Dump());
+            //     }
+            // }
+
+            // Texture2D out_texture = OpenCvSharp.Unity.MatToTexture(image);
+            // ToTensor(out_texture, inputs0);
+
+            
+
+            inputs0 = MatToFloatArray(image);
+
+            // byte[] bytes = out_texture.EncodeToPNG();
+            // var dirPath = Application.dataPath + "/../SaveImages/";
+            // Debug.Log(dirPath);
+            // if(!Directory.Exists(dirPath)) {
+            //     Directory.CreateDirectory(dirPath);
+            // }
+            // File.WriteAllBytes(dirPath + "Image" + ".png", bytes);
+
+            // Debug.Log(original_img);
+            // Debug.Log(patch_image);
+        }
+
+        public (float[,], float[,]) Postprocess()
+        {
+            float[,] pose_3d = Utils.SoftArgmax(outputs0, joint_num, depth_dim, output_shape);
+            // for (int i = 0; i < joint_num; i++)
+            // {
+            //     Debug.Log(pose_3d[i, 0].ToString() + " " + pose_3d[i, 1].ToString() + " " + pose_3d[i, 2]);
+            // }
+
+            // Normalize the x and y coordinates
+            for (int i = 0; i < joint_num; i++)
+            {
+                pose_3d[i, 0] = pose_3d[i, 0] / output_shape.Item2 * input_shape.Item2;
+                pose_3d[i, 1] = pose_3d[i, 1] / output_shape.Item1 * input_shape.Item1;
+            }
+
+            // Concatenate pose_3d with ones
+            float[,] pose_3d_xy1 = new float[joint_num, 3];
+            for (int i = 0; i < joint_num; i++)
+            {
+                pose_3d_xy1[i, 0] = pose_3d[i, 0];
+                pose_3d_xy1[i, 1] = pose_3d[i, 1];
+                pose_3d_xy1[i, 2] = 1;
+            }
+
+            // Concatenate img2bb_trans with [0, 0, 1]
+            float[,] img2bb_trans_001 = new float[3, 3];
+            for (int i = 0; i < 2; i++)
+            {
+                for (int j = 0; j < 3; j++)
+                {
+                    img2bb_trans_001[i, j] = img2bb_trans[i, j];
+                }
+            }
+            img2bb_trans_001[2, 0] = 0;
+            img2bb_trans_001[2, 1] = 0;
+            img2bb_trans_001[2, 2] = 1;
+
+            // Inverse img2bb_trans_001
+            float[,] img2bb_trans_001_inv = InverseMatrix3x3(img2bb_trans_001);
+
+            // for (int i = 0; i < 3; i++) {
+            //     Debug.Log(img2bb_trans_001_inv[i, 0].ToString() + " " + img2bb_trans_001_inv[i, 1].ToString() + " " + img2bb_trans_001_inv[i, 2].ToString());
+            // }
+
+            // for (int i = 0; i < 21; i++) {
+            //     Debug.Log(pose_3d_xy1[i, 0].ToString() + " " + pose_3d_xy1[i, 1].ToString());
+            // }
+
+            // Transpose img2bb_trans_001_inv
+            for (int i = 0; i < 3; i++)
+            {
+                for (int j = i + 1; j < 3; j++)
+                {
+                    float temp = img2bb_trans_001_inv[i, j];
+                    img2bb_trans_001_inv[i, j] = img2bb_trans_001_inv[j, i];
+                    img2bb_trans_001_inv[j, i] = temp;
+                }
+            }
+
+            // Multiply matrices
+            float[,] pose_3d_transformed = MultiplyMatrix(pose_3d_xy1, img2bb_trans_001_inv);
+
+            // Update the x and y coordinates
+            for (int i = 0; i < joint_num; i++)
+            {
+                pose_3d[i, 0] = pose_3d_transformed[i, 0];
+                pose_3d[i, 1] = pose_3d_transformed[i, 1];
+            }
+
+            // for (int i = 0; i < 21; i++) {
+            //     Debug.Log(pose_3d_transformed[i, 0].ToString() + " " + pose_3d_transformed[i, 1].ToString());
+            // }
+
+            float[,] output_pose_2d = (float[,])pose_3d.Clone();
+
+            // Calculate the absolute continuous depth
+            for (int i = 0; i < joint_num; i++)
+            {
+                pose_3d[i, 2] = (pose_3d[i, 2] / depth_dim * 2 - 1) * (bbox_3d_shape[0] / 2) + root_depth;
+            }
+
+            float[,] output_pose_3d = PixelToCam(pose_3d, focal, princpt);
+
+            return (output_pose_2d, output_pose_3d);
+        }
+
+        public async UniTask<Result[]> InvokeAsync(Texture inputTex, CancellationToken cancellationToken)
+        {
+            await ToTensorAsync(inputTex, inputTensor, cancellationToken);
+            await UniTask.SwitchToThreadPool();
+
+            interpreter.SetInputTensorData(0, inputTensor);
+            interpreter.Invoke();
+            interpreter.GetOutputTensorData(0, outputs0);
+
+            var results = GetResults();
+
+            await UniTask.SwitchToMainThread(cancellationToken);
+            return results;
+        }
+
+        public Result[] GetResults()
+        {
+            // Name alias
+            float[,,] scores = outputs0;
+            float[,,] offsets = scores;
+            float stride = scores.GetLength(0) - 1;
+
+            ApplySigmoid(scores);
+            var argmax = ArgMax2D(scores);
+
+            // Add offsets
+            for (int part = 0; part < results.Length; part++)
+            {
+                ArgMaxResult arg = argmax[part];
+                Result res = results[part];
+
+                float offsetX = offsets[arg.y, arg.x, part + results.Length];
+                float offsetY = offsets[arg.y, arg.x, part];
+                res.x = ((float)arg.x / stride * width + offsetX) / width;
+                res.y = ((float)arg.y / stride * height + offsetY) / height;
+                res.confidence = arg.score;
+                res.part = (Part)part;
+
+                results[part] = res;
+            }
+
+            return results;
+        }
+
+        public static float[,] InverseMatrix3x3(float[,] matrix)
+        {
+            float determinant = matrix[0, 0] * (matrix[1, 1] * matrix[2, 2] - matrix[2, 1] * matrix[1, 2]) -
+                                matrix[0, 1] * (matrix[1, 0] * matrix[2, 2] - matrix[1, 2] * matrix[2, 0]) +
+                                matrix[0, 2] * (matrix[1, 0] * matrix[2, 1] - matrix[1, 1] * matrix[2, 0]);
+
+            float invDet = 1 / determinant;
+
+            float[,] invMatrix = new float[3, 3];
+            invMatrix[0, 0] = (matrix[1, 1] * matrix[2, 2] - matrix[2, 1] * matrix[1, 2]) * invDet;
+            invMatrix[0, 1] = (matrix[0, 2] * matrix[2, 1] - matrix[0, 1] * matrix[2, 2]) * invDet;
+            invMatrix[0, 2] = (matrix[0, 1] * matrix[1, 2] - matrix[0, 2] * matrix[1, 1]) * invDet;
+            invMatrix[1, 0] = (matrix[1, 2] * matrix[2, 0] - matrix[1, 0] * matrix[2, 2]) * invDet;
+            invMatrix[1, 1] = (matrix[0, 0] * matrix[2, 2] - matrix[0, 2] * matrix[2, 0]) * invDet;
+            invMatrix[1, 2] = (matrix[1, 0] * matrix[0, 2] - matrix[0, 0] * matrix[1, 2]) * invDet;
+            invMatrix[2, 0] = (matrix[1, 0] * matrix[2, 1] - matrix[2, 0] * matrix[1, 1]) * invDet;
+            invMatrix[2, 1] = (matrix[2, 0] * matrix[0, 1] - matrix[0, 0] * matrix[2, 1]) * invDet;
+            invMatrix[2, 2] = (matrix[0, 0] * matrix[1, 1] - matrix[1, 0] * matrix[0, 1]) * invDet;
+
+            return invMatrix;
+        }
+
+        public static float[,] MultiplyMatrix(float[,] A, float[,] B)
+        {
+            int rowsA = A.GetLength(0);
+            int colsA = A.GetLength(1);
+            int rowsB = B.GetLength(0);
+            int colsB = B.GetLength(1);
+
+            if (colsA != rowsB)
+            {
+                throw new InvalidOperationException("Matrix dimensions are not valid for multiplication.");
+            }
+
+            float[,] result = new float[rowsA, colsB];
+
+            for (int i = 0; i < rowsA; i++)
+            {
+                for (int j = 0; j < colsB; j++)
+                {
+                    float sum = 0;
+                    for (int k = 0; k < colsA; k++)
+                    {
+                        sum += A[i, k] * B[k, j];
+                    }
+                    result[i, j] = sum;
+                }
+            }
+
+            return result;
+        }
+
+        public static float[,] PixelToCam(float[,] pose_3d, float[] focal, float[] princpt)
+        {
+            float[,] cam_pose_3d = new float[joint_num, 3];
+
+            for (int i = 0; i < joint_num; i++)
+            {
+                cam_pose_3d[i, 0] = (pose_3d[i, 0] - princpt[0]) * pose_3d[i, 2] / focal[0];
+                cam_pose_3d[i, 1] = (pose_3d[i, 1] - princpt[1]) * pose_3d[i, 2] / focal[1];
+                cam_pose_3d[i, 2] = pose_3d[i, 2];
+            }
+
+            return cam_pose_3d;
+        }
+
+        static void ApplySigmoid(float[,,] arr)
+        {
+            int rows = arr.GetLength(0); // y
+            int cols = arr.GetLength(1); // x
+            int parts = arr.GetLength(2);
+            // simgoid to get score
+            for (int y = 0; y < rows; y++)
+            {
+                for (int x = 0; x < cols; x++)
+                {
+                    for (int part = 0; part < parts; part++)
+                    {
+                        arr[y, x, part] = MathTF.Sigmoid(arr[y, x, part]);
+                    }
+                }
+            }
+        }
+
+        struct ArgMaxResult
+        {
+            public int x;
+            public int y;
+            public float score;
+        }
+
+        static ArgMaxResult[] argMaxResults;
+        static ArgMaxResult[] ArgMax2D(float[,,] scores)
+        {
+            int rows = scores.GetLength(0); //y
+            int cols = scores.GetLength(1); //x
+            int parts = scores.GetLength(2);
+
+            // Init with minimum float
+            if (argMaxResults == null)
+            {
+                argMaxResults = new ArgMaxResult[parts];
+            }
+            for (int i = 0; i < parts; i++)
+            {
+                argMaxResults[i].score = float.MinValue;
+            }
+
+            // ArgMax
+            for (int y = 0; y < rows; y++)
+            {
+                for (int x = 0; x < cols; x++)
+                {
+                    for (int part = 0; part < parts; part++)
+                    {
+                        float current = scores[y, x, part];
+                        if (current > argMaxResults[part].score)
+                        {
+                            argMaxResults[part] = new ArgMaxResult()
+                            {
+                                x = x,
+                                y = y,
+                                score = current,
+                            };
+                        }
+                    }
+                }
+            }
+            return argMaxResults;
+        }
+
+
+    }
+}
